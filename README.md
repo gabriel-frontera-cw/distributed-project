@@ -7,8 +7,8 @@ Features
 - Config-driven (YAML) with CLI overrides (`--key.subkey=value`).
 - Native `torch.distributed` via `torchrun` (single/multi-node).
 - Precision: fp32, AMP (fp16), bf16, channels_last.
-- Benchmark methodology: warmup discard, fixed steps/time window.
-- Metrics: per-epoch JSONL, final JSON + CSV summary (rank 0 only).
+- Benchmark methodology: warmup discard, fixed steps/time window; per-step timing includes optimizer and uses CUDA events when available.
+- Metrics: per-epoch JSONL, final JSON + CSV summary (rank 0 only) with global aggregation across ranks (samples summed, time maxed).
 - Env capture: host, GPUs, CUDA/driver, PyTorch, NCCL env.
 - Optional `torch.profiler` trace (rank 0).
 - Real (CIFAR100) or synthetic data mode.
@@ -53,7 +53,7 @@ Benchmarking Methodology
 Distributed Training
 - Uses `torchrun` environment variables (`RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`).
 - Backend defaults to `nccl` if CUDA available, else `gloo`.
-- Only rank 0 writes logs.
+- Only rank 0 writes logs; throughput and totals are aggregated across all ranks for comparability.
 
 Profiler (optional)
 - Enable via config section:
@@ -71,7 +71,8 @@ Repro Checklist
 
 Interpreting Results
 - Per-epoch JSONL: `results/<exp>/<run>/metrics_epoch.jsonl`.
-- Run summary JSON: `results/<exp>/<run>/run_summary.json` (also CSV `summary.csv`).
+- Run summary JSON: `results/<exp>/<run>/run_summary.json` (also CSV `summary.csv`). Includes `commit_hash`, `global_batch_size`, and `effective_batch_size` in addition to totals and timing.
+- Resolved config used for the run is saved at `results/<exp>/<run>/config_resolved.yaml`.
 - Use `notebooks/analysis.ipynb` to plot throughput vs. GPU count, scaling efficiency, total time, and step-time distributions.
 
 Troubleshooting
