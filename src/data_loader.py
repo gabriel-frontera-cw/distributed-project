@@ -49,15 +49,26 @@ def get_dataloader(config: dict, is_distributed: bool) -> Tuple[DataLoader, Opti
 
     sampler = DistributedSampler(dataset) if is_distributed else None
 
-    dl = DataLoader(
-        dataset,
+    num_workers = int(dcfg.get("num_workers", 8))
+    pin_memory = bool(dcfg.get("pin_memory", True))
+
+    dl_kwargs = dict(
         batch_size=dcfg["batch_size"],
         shuffle=(sampler is None),
         sampler=sampler,
-        num_workers=dcfg.get("num_workers", 8),
-        pin_memory=dcfg.get("pin_memory", True),
-        prefetch_factor=dcfg.get("prefetch_factor", 2),
-        persistent_workers=dcfg.get("persistent_workers", True),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    # Guard params invalid when num_workers == 0
+    if num_workers > 0:
+        dl_kwargs.update(
+            prefetch_factor=dcfg.get("prefetch_factor", 2),
+            persistent_workers=bool(dcfg.get("persistent_workers", True)),
+        )
+
+    dl = DataLoader(
+        dataset,
+        **dl_kwargs,
     )
 
     return dl, sampler

@@ -89,7 +89,7 @@ class Trainer:
         # Gradient accumulation
         self.grad_accum_steps = int(config["distributed"].get("gradient_accumulation_steps", 1))
 
-    def _step(self, batch, autocast_dtype, sync_cuda: bool) -> Tuple[int, float]:
+    def _step(self, batch, autocast_dtype, sync_cuda: bool, do_step: bool) -> Tuple[int, float]:
         inputs, targets = batch
         inputs = inputs.to(self.device, non_blocking=True)
         targets = targets.to(self.device, non_blocking=True)
@@ -98,17 +98,54 @@ class Trainer:
 
         batch_size = inputs.size(0)
 
-        with Timer() as t:
-            with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=(self.use_amp or autocast_dtype in (torch.bfloat16,))):
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets) / self.grad_accum_steps
+        # Use CUDA events for accurate timing when available
+        use_cuda_timing = self.device.type == "cuda"
+        if use_cuda_timing:
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+        else:
+            timer = Timer()
+            timer.__enter__()
+
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=autocast_dtype,
+            enabled=(self.use_amp or autocast_dtype in (torch.bfloat16,)),
+        ):
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets) / self.grad_accum_steps
+
+        if self.use_amp:
+            self.grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if do_step:
+            # Gradient clipping (supports AMP via unscale_)
+            max_norm = self.config["training"].get("grad_clip_norm")
+            if max_norm is not None:
+                if self.use_amp:
+                    self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(max_norm))
 
             if self.use_amp:
-                self.grad_scaler.scale(loss).backward()
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
             else:
-                loss.backward()
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            return batch_size, t.ms
+        if use_cuda_timing:
+            end_evt.record()
+            if sync_cuda:
+                torch.cuda.synchronize()
+            step_ms = start_evt.elapsed_time(end_evt)
+        else:
+            timer.__exit__(None, None, None)
+            step_ms = timer.ms
+
+        return batch_size, step_ms
 
         # unreachable
 
@@ -121,7 +158,7 @@ class Trainer:
         overall_start = time.perf_counter()
         total_steps_all = 0
         total_samples_all = 0
-        total_measured_time = 0.0
+        total_measured_time_agg = 0.0
 
         # Optional profiler (rank 0 only writes)
         trace_path = os.path.join(self.out_dir, "trace_rank0.json") if (self.profile_enabled and self.rank == 0) else None
@@ -180,21 +217,8 @@ class Trainer:
                     if measuring and measure_by == "time" and measure_time_start is None:
                         measure_time_start = time.perf_counter()
 
-                    batch_size, step_ms = self._step(batch, self.autocast_dtype, sync_cuda)
-
-                    if sync_cuda:
-                        torch.cuda.synchronize()
-                        # recalc elapsed strictly
-                        # Note: strict timing is already covered by sync around step, but we keep minimal.
-
-                    # Optimizer step per accum
-                    if total_steps % self.grad_accum_steps == 0:
-                        if self.use_amp:
-                            self.grad_scaler.step(self.optimizer)
-                            self.grad_scaler.update()
-                        else:
-                            self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True)
+                    do_step = (total_steps % self.grad_accum_steps == 0)
+                    batch_size, step_ms = self._step(batch, self.autocast_dtype, sync_cuda, do_step)
 
                     total_steps_all += 1
                     total_samples_all += batch_size
@@ -228,23 +252,69 @@ class Trainer:
                     measured_time_s = (mean_ms / 1000.0) * measured_steps if mean_ms > 0 else epoch_time_s
                 else:
                     measured_time_s = min(measure_seconds, epoch_time_s) if measure_seconds else epoch_time_s
-                total_measured_time += measured_time_s
+                # Aggregate across ranks for throughput comparability
+                if self.world_size > 1 and dist.is_initialized():
+                    tdev = self.device if self.device.type == "cuda" else torch.device("cpu")
+                    msamp_t = torch.tensor([measured_samples], device=tdev, dtype=torch.long)
+                    mtime_t = torch.tensor([measured_time_s], device=tdev, dtype=torch.float64)
+                    msteps_t = torch.tensor([measured_steps], device=tdev, dtype=torch.long)
+                    tsteps_t = torch.tensor([total_steps], device=tdev, dtype=torch.long)
+                    etime_t = torch.tensor([epoch_time_s], device=tdev, dtype=torch.float64)
+                    dist.all_reduce(msamp_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(mtime_t, op=dist.ReduceOp.MAX)
+                    dist.all_reduce(msteps_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(tsteps_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(etime_t, op=dist.ReduceOp.MAX)
+                    measured_samples_g = int(msamp_t.item())
+                    measured_time_s_g = float(mtime_t.item())
+                    measured_steps_g = int(msteps_t.item())
+                    total_steps_g = int(tsteps_t.item())
+                    epoch_time_s_g = float(etime_t.item())
+                else:
+                    measured_samples_g = measured_samples
+                    measured_time_s_g = measured_time_s
+                    measured_steps_g = measured_steps
+                    total_steps_g = total_steps
+                    epoch_time_s_g = epoch_time_s
+                total_measured_time_agg += measured_time_s_g
             else:
                 measured_time_s = epoch_time_s
+                # No aggregation; single-process values
+                measured_samples_g = measured_samples
+                measured_time_s_g = measured_time_s
+                measured_steps_g = measured_steps
+                total_steps_g = total_steps
+                epoch_time_s_g = epoch_time_s
 
-            throughput = (measured_samples / measured_time_s) if measured_time_s and measured_time_s > 0 else 0.0
+            throughput = (measured_samples_g / measured_time_s_g) if measured_time_s_g and measured_time_s_g > 0 else 0.0
 
             # Log per-epoch metrics (rank 0 only writes in MetricLogger)
             self.metric_logger.log_epoch(
                 epoch=epoch,
                 throughput_samples_per_s=throughput,
-                epoch_time_s=epoch_time_s,
-                total_steps=total_steps,
-                measured_steps=measured_steps,
-                measured_samples=measured_samples,
+                epoch_time_s=epoch_time_s_g,
+                total_steps=total_steps_g,
+                measured_steps=measured_steps_g,
+                measured_samples=measured_samples_g,
             )
 
         wall_clock_s = time.perf_counter() - overall_start
+        # Aggregate final totals across ranks for summary
+        if self.world_size > 1 and dist.is_initialized():
+            tdev = self.device if self.device.type == "cuda" else torch.device("cpu")
+            tot_steps_t = torch.tensor([total_steps_all], device=tdev, dtype=torch.long)
+            tot_samples_t = torch.tensor([total_samples_all], device=tdev, dtype=torch.long)
+            wall_clock_t = torch.tensor([wall_clock_s], device=tdev, dtype=torch.float64)
+            dist.all_reduce(tot_steps_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tot_samples_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(wall_clock_t, op=dist.ReduceOp.MAX)
+            total_steps_all_g = int(tot_steps_t.item())
+            total_samples_all_g = int(tot_samples_t.item())
+            wall_clock_s_g = float(wall_clock_t.item())
+        else:
+            total_steps_all_g = total_steps_all
+            total_samples_all_g = total_samples_all
+            wall_clock_s_g = wall_clock_s
 
         # Final summary (rank 0 writes)
         run_summary = {
@@ -254,10 +324,13 @@ class Trainer:
             "precision": self.config["training"]["precision"],
             "channels_last": self.config["model"].get("channels_last", False),
             "batch_size": self.config["data"]["batch_size"],
-            "total_steps": total_steps_all,
-            "total_samples": total_samples_all,
-            "total_measured_time_s": total_measured_time,
-            "total_wall_clock_s": wall_clock_s,
+            "global_batch_size": int(self.config["data"]["batch_size"]) * int(self.world_size),
+            "effective_batch_size": int(self.config["data"]["batch_size"]) * int(self.world_size) * int(self.grad_accum_steps),
+            "total_steps": total_steps_all_g,
+            "total_samples": total_samples_all_g,
+            "total_measured_time_s": total_measured_time_agg,
+            "total_wall_clock_s": wall_clock_s_g,
+            "commit_hash": self.config["run"].get("commit_hash"),
             "env": env_meta,
             "notes": self.config["run"].get("notes", ""),
         }

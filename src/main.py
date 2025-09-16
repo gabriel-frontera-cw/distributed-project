@@ -130,6 +130,14 @@ def main(argv=None):
         print(cfg.json(indent=2))
 
     trainer = Trainer(cfg.dict(), rank, local_rank, world_size)
+    # Persist the resolved config for reproducibility (rank 0 only)
+    if rank == 0:
+        try:
+            resolved_cfg_path = os.path.join(trainer.out_dir, "config_resolved.yaml")
+            with open(resolved_cfg_path, "w") as f:
+                yaml.safe_dump(cfg.dict(), f, sort_keys=False)
+        except Exception:
+            pass
     summary = trainer.train()
 
     # Teardown
